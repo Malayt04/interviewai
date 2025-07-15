@@ -4,6 +4,7 @@ import Image from "next/image";
 import { useState, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
+import Link from "next/link";
 
 import { cn } from "@/lib/utils";
 import { vapi } from "@/lib/vapi.sdk";
@@ -41,6 +42,10 @@ const Agent = ({
   const [editorContent, setEditorContent] = useState<string>("");
   const [editorVisible, setEditorVisible] = useState(false);
   const [isEditorSubmitting, setIsEditorSubmitting] = useState(false);
+  const [isInCodingQuestion, setIsInCodingQuestion] = useState(false);
+  const [codingQuestionStarted, setCodingQuestionStarted] = useState(false);
+  const [codingQuestionTimeout, setCodingQuestionTimeout] =
+    useState<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     const onCallStart = () => {
@@ -49,6 +54,14 @@ const Agent = ({
 
     const onCallEnd = () => {
       setCallStatus(CallStatus.FINISHED);
+      // Reset coding question state when call ends
+      setIsInCodingQuestion(false);
+      setCodingQuestionStarted(false);
+      // Clear timeout
+      if (codingQuestionTimeout) {
+        clearTimeout(codingQuestionTimeout);
+        setCodingQuestionTimeout(null);
+      }
     };
 
     const onMessage = (message: Message) => {
@@ -89,6 +102,15 @@ const Agent = ({
     };
   }, []);
 
+  // Cleanup timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (codingQuestionTimeout) {
+        clearTimeout(codingQuestionTimeout);
+      }
+    };
+  }, [codingQuestionTimeout]);
+
   useEffect(() => {
     if (messages.length > 0) {
       setLastMessage(messages[messages.length - 1].content);
@@ -125,12 +147,68 @@ const Agent = ({
   useEffect(() => {
     if (
       lastMessage.toLowerCase().includes("write") &&
-      callStatus === CallStatus.ACTIVE
+      callStatus === CallStatus.ACTIVE &&
+      !codingQuestionStarted
     ) {
-      // Instead of automatically showing the editor, we'll make a button visible
-      console.log("Writing prompt detected");
+      // Start a coding question
+      console.log("Writing prompt detected - starting coding question");
+      setIsInCodingQuestion(true);
+      setCodingQuestionStarted(true);
+    } else if (
+      lastMessage.toLowerCase().includes("write") &&
+      callStatus === CallStatus.ACTIVE &&
+      codingQuestionStarted
+    ) {
+      // Continue in coding question
+      setIsInCodingQuestion(true);
+    } else if (
+      !lastMessage.toLowerCase().includes("write") &&
+      callStatus === CallStatus.ACTIVE &&
+      codingQuestionStarted
+    ) {
+      // Check if the AI has acknowledged the code submission or moved to next question
+      const codeSubmissionKeywords = [
+        "good",
+        "well done",
+        "excellent",
+        "nice work",
+        "that's correct",
+        "let's move on",
+        "next question",
+        "thank you",
+        "great job",
+      ];
+
+      const hasAcknowledgedSubmission = codeSubmissionKeywords.some((keyword) =>
+        lastMessage.toLowerCase().includes(keyword)
+      );
+
+      if (hasAcknowledgedSubmission) {
+        // Coding question completed
+        setIsInCodingQuestion(false);
+        setCodingQuestionStarted(false);
+        // Clear any existing timeout
+        if (codingQuestionTimeout) {
+          clearTimeout(codingQuestionTimeout);
+          setCodingQuestionTimeout(null);
+        }
+      } else {
+        // Still in coding question, don't hide the button yet
+        setIsInCodingQuestion(true);
+
+        // Set a timeout to automatically close the coding question after 30 seconds
+        if (codingQuestionTimeout) {
+          clearTimeout(codingQuestionTimeout);
+        }
+        const timeout = setTimeout(() => {
+          setIsInCodingQuestion(false);
+          setCodingQuestionStarted(false);
+          setCodingQuestionTimeout(null);
+        }, 30000); // 30 seconds
+        setCodingQuestionTimeout(timeout);
+      }
     }
-  }, [lastMessage, callStatus]);
+  }, [lastMessage, callStatus, codingQuestionStarted]);
 
   const handleCall = async () => {
     setCallStatus(CallStatus.CONNECTING);
@@ -178,11 +256,8 @@ const Agent = ({
   };
 
   const shouldShowEditorButton = useMemo(() => {
-    return (
-      lastMessage.toLowerCase().includes("write") &&
-      callStatus === CallStatus.ACTIVE
-    );
-  }, [lastMessage, callStatus]);
+    return isInCodingQuestion && callStatus === CallStatus.ACTIVE;
+  }, [isInCodingQuestion, callStatus]);
 
   const openEditor = () => {
     setEditorVisible(true);
@@ -193,11 +268,29 @@ const Agent = ({
     try {
       // Simulate a small delay for better UX
       await new Promise((resolve) => setTimeout(resolve, 500));
-      setMessages((prev) => [
-        ...prev,
-        { role: "user", content: "Here is the code I wrote: " + editorContent },
-      ]);
+
+      // Send the code to the AI via Vapi
+      const codeMessage = "Here is the code I wrote: " + editorContent;
+      await vapi.send({
+        type: "add-message",
+        message: {
+          role: "user",
+          content: codeMessage,
+        },
+      });
+
+      // Also add to local messages for transcript
+      setMessages((prev) => [...prev, { role: "user", content: codeMessage }]);
+
       setEditorVisible(false);
+      // Reset coding question state after submission
+      setIsInCodingQuestion(false);
+      setCodingQuestionStarted(false);
+      // Clear timeout
+      if (codingQuestionTimeout) {
+        clearTimeout(codingQuestionTimeout);
+        setCodingQuestionTimeout(null);
+      }
     } finally {
       setIsEditorSubmitting(false);
     }
@@ -282,7 +375,7 @@ const Agent = ({
           </div>
 
           {/* Editor Button - Only shows when a writing prompt is detected */}
-          {shouldShowEditorButton && !editorVisible && (
+          {shouldShowEditorButton && (
             <Button
               onClick={openEditor}
               className="absolute right-4 bottom-4 bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg transition-colors flex items-center"
@@ -308,26 +401,35 @@ const Agent = ({
       )}
 
       {/* Call / Disconnect Button */}
-      <div className="w-full flex justify-center mt-6">
+      <div className="w-full flex justify-center mt-6 gap-4">
         {callStatus !== "ACTIVE" ? (
-          <Button
-            className="relative btn-call"
-            onClick={handleCall}
-            loading={callStatus === "CONNECTING"}
-            loadingText="Connecting..."
-          >
-            <span
-              className={cn(
-                "absolute animate-ping rounded-full opacity-75",
-                callStatus !== "CONNECTING" && "hidden"
-              )}
-            />
-            <span className="relative">
-              {callStatus === "INACTIVE" || callStatus === "FINISHED"
-                ? "Call"
-                : ". . ."}
-            </span>
-          </Button>
+          <>
+            <Button
+              className="relative btn-call"
+              onClick={handleCall}
+              loading={callStatus === "CONNECTING"}
+              loadingText="Connecting..."
+            >
+              <span
+                className={cn(
+                  "absolute animate-ping rounded-full opacity-75",
+                  callStatus !== "CONNECTING" && "hidden"
+                )}
+              />
+              <span className="relative">
+                {callStatus === "INACTIVE" || callStatus === "FINISHED"
+                  ? "Call"
+                  : ". . ."}
+              </span>
+            </Button>
+            <Link
+              href="/interview/generate/upload-resume"
+              passHref
+              legacyBehavior
+            >
+              <Button className="btn-secondary">Upload Resume</Button>
+            </Link>
+          </>
         ) : (
           <Button className="btn-disconnect" onClick={handleDisconnect}>
             End
